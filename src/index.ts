@@ -7,6 +7,19 @@ import { z } from "zod";
 // Solodit API configuration
 const SOLODIT_API_BASE_URL = "https://solodit.cyfrin.io/api/v1/solodit";
 const SOLODIT_API_KEY = process.env.SOLODIT_API_KEY || "";
+const SOLODIT_API_TIMEOUT_MS = (() => {
+  const raw = process.env.SOLODIT_API_TIMEOUT_MS;
+  if (raw === undefined) return 15000;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 15000;
+
+  const rounded = Math.round(parsed);
+  if (rounded < 1000) return 1000;
+  if (rounded > 120000) return 120000;
+  return rounded;
+})();
+const SOLODIT_API_MAX_RETRIES = 1;
 
 // Type definitions based on the API spec
 interface SoloditFilters {
@@ -80,6 +93,96 @@ interface SoloditResponse {
   };
 }
 
+class SoloditApiError extends Error {
+  readonly status: number;
+  readonly retryAfterMs: number | null;
+
+  constructor(status: number, message: string, retryAfterMs: number | null) {
+    super(message);
+    this.name = "SoloditApiError";
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatToolError(toolName: string, error: unknown): string {
+  if (error instanceof SoloditApiError) {
+    const base = `Solodit API error (${error.status}): ${error.message}`;
+    if (error.status === 401 || error.status === 403) {
+      return `${base}\n\nCheck that \`SOLODIT_API_KEY\` is set and valid.`;
+    }
+    if (error.status === 429) {
+      return `${base}\n\nRate limit exceeded. Try again shortly (or reduce page size / request frequency).`;
+    }
+    return base;
+  }
+
+  if (error instanceof Error) {
+    if (error.message.includes("SOLODIT_API_KEY")) return error.message;
+    return `${toolName} failed: ${error.message}`;
+  }
+
+  return `${toolName} failed with an unknown error.`;
+}
+
+function parseRetryAfterMs(headerValue: string | null): number | null {
+  if (!headerValue) return null;
+
+  const seconds = Number(headerValue);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+
+  const asDate = Date.parse(headerValue);
+  if (!Number.isNaN(asDate)) {
+    const delta = asDate - Date.now();
+    return delta > 0 ? delta : 0;
+  }
+
+  return null;
+}
+
+async function fetchJsonWithTimeout<T>(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      let message = response.statusText || "Request failed";
+      const retryAfterMs = parseRetryAfterMs(
+        response.headers.get("retry-after")
+      );
+
+      if (bodyText) {
+        try {
+          const parsed = JSON.parse(bodyText) as { message?: unknown };
+          if (typeof parsed.message === "string" && parsed.message.trim()) {
+            message = parsed.message;
+          }
+        } catch {
+          // Non-JSON error bodies are common; keep statusText + attach snippet.
+          message = `${message}${bodyText ? `: ${bodyText.slice(0, 500)}` : ""}`;
+        }
+      }
+
+      throw new SoloditApiError(response.status, message, retryAfterMs);
+    }
+
+    return (await response.json()) as T;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 // Function to search Solodit findings
 async function searchSoloditFindings(
   request: SoloditRequest
@@ -90,25 +193,47 @@ async function searchSoloditFindings(
     );
   }
 
-  const response = await fetch(`${SOLODIT_API_BASE_URL}/findings`, {
+  const url = `${SOLODIT_API_BASE_URL}/findings`;
+  const init: RequestInit = {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Cyfrin-API-Key": SOLODIT_API_KEY,
     },
     body: JSON.stringify(request),
-  });
+  };
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(
-      `Solodit API error (${response.status}): ${
-        errorData.message || response.statusText
-      }`
-    );
+  for (let attempt = 0; attempt <= SOLODIT_API_MAX_RETRIES; attempt++) {
+    try {
+      return await fetchJsonWithTimeout<SoloditResponse>(
+        url,
+        init,
+        SOLODIT_API_TIMEOUT_MS
+      );
+    } catch (error) {
+      if (
+        attempt < SOLODIT_API_MAX_RETRIES &&
+        error instanceof SoloditApiError &&
+        error.status === 429
+      ) {
+        await sleep(error.retryAfterMs ?? 2000);
+        continue;
+      }
+
+      if (
+        attempt < SOLODIT_API_MAX_RETRIES &&
+        error instanceof Error &&
+        (error.name === "AbortError" || error instanceof TypeError)
+      ) {
+        await sleep(500);
+        continue;
+      }
+
+      throw error;
+    }
   }
 
-  return await response.json();
+  throw new Error("Unreachable: retries exhausted");
 }
 
 // Format a finding for display
@@ -234,52 +359,54 @@ mcpServer.registerTool(
     },
   },
   async (args) => {
-    // Build the filters object
-    const filters: SoloditFilters = {};
+    try {
+      // Build the filters object
+      const filters: SoloditFilters = {};
 
-    if (args.keywords) filters.keywords = args.keywords;
-    if (args.impact) filters.impact = args.impact;
-    if (args.firms) filters.firms = args.firms.map((f) => ({ value: f }));
-    if (args.tags) filters.tags = args.tags.map((t) => ({ value: t }));
-    if (args.protocol) filters.protocol = args.protocol;
-    if (args.protocolCategory)
-      filters.protocolCategory = args.protocolCategory.map((c) => ({
-        value: c,
-      }));
-    if (args.languages)
-      filters.languages = args.languages.map((l) => ({
-        value: l,
-      }));
-    if (args.user) filters.user = args.user;
-    if (args.minFinders) filters.minFinders = args.minFinders;
-    if (args.maxFinders) filters.maxFinders = args.maxFinders;
-    if (args.reportedDays)
-      filters.reported = {
-        value: args.reportedDays,
+      if (args.keywords) filters.keywords = args.keywords;
+      if (args.impact) filters.impact = args.impact;
+      if (args.firms) filters.firms = args.firms.map((f) => ({ value: f }));
+      if (args.tags) filters.tags = args.tags.map((t) => ({ value: t }));
+      if (args.protocol) filters.protocol = args.protocol;
+      if (args.protocolCategory)
+        filters.protocolCategory = args.protocolCategory.map((c) => ({
+          value: c,
+        }));
+      if (args.languages)
+        filters.languages = args.languages.map((l) => ({
+          value: l,
+        }));
+      if (args.user) filters.user = args.user;
+      if (args.minFinders) filters.minFinders = args.minFinders;
+      if (args.maxFinders) filters.maxFinders = args.maxFinders;
+      if (args.reportedDays)
+        filters.reported = {
+          value: args.reportedDays,
+        };
+      if (args.qualityScore !== undefined)
+        filters.qualityScore = args.qualityScore;
+      if (args.rarityScore !== undefined)
+        filters.rarityScore = args.rarityScore;
+      if (args.sortField) filters.sortField = args.sortField;
+      if (args.sortDirection) filters.sortDirection = args.sortDirection;
+
+      const searchRequest: SoloditRequest = {
+        page: args.page || 1,
+        pageSize: args.pageSize || 20,
       };
-    if (args.qualityScore !== undefined)
-      filters.qualityScore = args.qualityScore;
-    if (args.rarityScore !== undefined) filters.rarityScore = args.rarityScore;
-    if (args.sortField) filters.sortField = args.sortField;
-    if (args.sortDirection) filters.sortDirection = args.sortDirection;
 
-    const searchRequest: SoloditRequest = {
-      page: args.page || 1,
-      pageSize: args.pageSize || 20,
-    };
+      if (Object.keys(filters).length > 0) {
+        searchRequest.filters = filters;
+      }
 
-    if (Object.keys(filters).length > 0) {
-      searchRequest.filters = filters;
-    }
+      const response = await searchSoloditFindings(searchRequest);
 
-    const response = await searchSoloditFindings(searchRequest);
+      // Format the findings
+      const formattedFindings = response.findings
+        .map((f) => formatFinding(f))
+        .join("\n\n");
 
-    // Format the findings
-    const formattedFindings = response.findings
-      .map((f) => formatFinding(f))
-      .join("\n\n");
-
-    const summary = `
+      const summary = `
 # Solodit Search Results
 
 **Total Results:** ${response.metadata.totalResults}
@@ -293,14 +420,24 @@ mcpServer.registerTool(
 ${formattedFindings}
 `.trim();
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: summary,
-        },
-      ],
-    };
+      return {
+        content: [
+          {
+            type: "text",
+            text: summary,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: formatToolError("search_findings", error),
+          },
+        ],
+      };
+    }
   }
 );
 
@@ -315,40 +452,41 @@ mcpServer.registerTool(
     },
   },
   async (args) => {
-    const searchRequest: SoloditRequest = {
-      page: 1,
-      pageSize: 1,
-      filters: {
-        keywords: args.keywords,
-      },
-    };
-
-    const response = await searchSoloditFindings(searchRequest);
-
-    if (response.findings.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `No finding found with ID or slug: ${args.keywords}`,
-          },
-        ],
+    try {
+      const searchRequest: SoloditRequest = {
+        page: 1,
+        pageSize: 1,
+        filters: {
+          keywords: args.keywords,
+        },
       };
-    }
 
-    const finding = response.findings[0];
-    if (!finding) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `No finding found with ID or slug: ${args.keywords}`,
-          },
-        ],
-      };
-    }
+      const response = await searchSoloditFindings(searchRequest);
 
-    const formattedFinding = `
+      if (response.findings.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No finding found with ID or slug: ${args.keywords}`,
+            },
+          ],
+        };
+      }
+
+      const finding = response.findings[0];
+      if (!finding) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No finding found with ID or slug: ${args.keywords}`,
+            },
+          ],
+        };
+      }
+
+      const formattedFinding = `
 # ${finding.title}
 
 **ID:** ${finding.id}
@@ -370,14 +508,24 @@ mcpServer.registerTool(
 ${finding.content}
 `.trim();
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: formattedFinding,
-        },
-      ],
-    };
+      return {
+        content: [
+          {
+            type: "text",
+            text: formattedFinding,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: formatToolError("get_finding_by_id", error),
+          },
+        ],
+      };
+    }
   }
 );
 
